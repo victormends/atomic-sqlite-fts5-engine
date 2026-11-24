@@ -1,6 +1,6 @@
 # atomic-sqlite-fts5-engine
 
-A zero-dependency Python 3.11+ stdlib (`sqlite3`) shadow-build indexer (CI-verified on Ubuntu 3.11 and 3.12; compatible with 3.9+) and deterministic read-only search engine for operational incident logs, post-mortems, and runbook archives.
+A zero-dependency Python 3.11+ stdlib (`sqlite3`) shadow-build indexer (CI-verified on Ubuntu 3.11 and 3.12) and deterministic read-only search engine for operational incident logs, post-mortems, and runbook archives.
 
 ---
 
@@ -69,7 +69,7 @@ It does **not**:
 | Dimension | `atomic-sqlite-fts5-engine` | Distributed Engines (Elasticsearch / OpenSearch) |
 | :--- | :--- | :--- |
 | **Operational Footprint** | Zero external deps, zero daemon/JVM, single `.db` artifact | Multi-node cluster, JVM memory tuning, shard/replica ops |
-| **Local Read Latency** | Single-digit millisecond in-process C library reads | Network hop + coordinator scatter-gather overhead |
+| **Local Read Latency** | Low-tens-of-milliseconds in-process C library reads (measured 1.7 ms min / 17.3 ms P50 on 5k docs with BM25 + snippet extraction; zero network hop) | Network hop + coordinator scatter-gather overhead |
 | **Hybrid Structured + Text** | Single SQLite query joining `documents_fts` BM25 with composite B-tree indexes | Requires denormalized duplication or costly cross-index joins |
 | **Write Pattern Fit** | **Batch / periodic shadow rebuilds** (archives, post-mortems, runbooks) | **Continuous high-QPS real-time writes** across concurrent writers |
 | **Scale Ceiling** | Single-node storage/RAM envelope | Multi-terabyte horizontal sharding across clusters |
@@ -80,7 +80,7 @@ It does **not**:
 
 - **`documents`**: Canonical table storing `doc_uid` (`UNIQUE`), `doc_type` (`incident`, `postmortem`, `runbook`), `service_key`, `severity`, `timestamp_ms`, `occurred_at`, `author`, `title`, `body`, `tags`, and `metadata_json`.
 - **Composite Indexes**: `idx_documents_service_ts (service_key, timestamp_ms)`, `idx_documents_severity_ts (severity, timestamp_ms)`, `idx_documents_ts (timestamp_ms)`, `idx_documents_type_ts (doc_type, timestamp_ms)`.
-- **`documents_fts`**: FTS5 virtual table (`tokenize='unicode61 remove_diacritics 2'`) synced 1:1 via `rowid == documents.id`, supporting accent-insensitive Unicode lookup (`"exaustao critica"` matches `"Exaustao critica"` with diacritics).
+- **`documents_fts`**: FTS5 virtual table (`tokenize='unicode61 remove_diacritics 2'`) synced 1:1 via `rowid == documents.id`, supporting accent-insensitive Unicode lookup (`"exaustao critica"` matches `"Exaustão crítica"`).
 - **Two-Phase BM25 & Deferred `snippet()`**: Top-K ranking executes first; `snippet()` evaluates only on the returned `LIMIT` rowids.
 - **FTS5 Pre-Filter + Regex Refinement**: Combines FTS5 candidate narrowing with compiled `re.Pattern` filtering and safely falls back to metadata scan when alternations `|` or optional quantifiers make token extraction unsound.
 
@@ -88,7 +88,7 @@ It does **not**:
 
 ## Installation & CLI Usage
 
-Requires **Python 3.11+** (CI-verified on Ubuntu 3.11 and 3.12; compatible with 3.9+, `pytest` for tests).
+Requires **Python 3.11+** (CI-verified on Ubuntu 3.11 and 3.12, `pytest` for tests).
 
 ```bash
 python -m pip install -e ".[dev]"
