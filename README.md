@@ -1,98 +1,98 @@
 # atomic-sqlite-fts5-engine
 
-Zero-dependency Python 3.9+ stdlib (`sqlite3`) atomic shadow-build indexer and deterministic read-only search engine for **Production Incident Logs, Post-Mortems & Runbook Archives**.
+A zero-dependency Python 3.9+ stdlib (`sqlite3`) shadow-build indexer and deterministic read-only search engine for operational incident logs, post-mortems, and runbook archives.
 
 ---
 
-## Why Atomic Shadow Builds?
+## Why This Exists
 
-Rebuilding a full-text search index directly inside a live SQLite database introduces three operational hazards:
+Rebuilding an FTS5 search index directly inside a live SQLite database introduces three operational hazards:
 
-1. **Write-Amplification & Lock Contention:** Maintaining a rollback journal or WAL across tens of thousands of `INSERT`s plus FTS5 inverted-index merges forces repeated disk flushes and causes `SQLITE_BUSY` contention for concurrent readers.
-2. **Torn Rebuilds on Crash:** An unhandled exception, OOM kill, or disk error mid-rebuild leaves partial `documents` rows or out-of-sync `documents_fts` shadow tables in production.
-3. **Sidecar Drift Across Swaps:** Replacing a database file while stale `-wal` or `-shm` sidecars remain next to the target path can corrupt page visibility or replay orphaned frames.
+1. **Write-Amplification & Lock Contention:** Maintaining a rollback journal or WAL across tens of thousands of inserts plus FTS5 inverted-index merges triggers repeated fsync flushes and `SQLITE_BUSY` contention for active readers.
+2. **Torn Rebuilds on Crash:** An unhandled exception, OOM kill, or disk full mid-rebuild leaves partial `documents` rows or corrupted FTS5 shadow tables in production.
+3. **Sidecar Drift & Windows File Locks:** Swapping a `.db` file next to stale `-wal`/`-shm` sidecars corrupts visibility, and on Windows any unclosed SQLite handle breaks atomic file replacement (`os.replace`).
 
-`atomic-sqlite-fts5-engine` eliminates all three failure modes by decoupling **build** from **serving**:
+`atomic-sqlite-fts5-engine` separates **offline shadow building** (`<target>.<pid>.<uuid>.tmp` with `PRAGMA journal_mode=OFF` and deferred secondary indexes) from **strict read-only serving** (`?mode=ro` + `PRAGMA query_only=ON`).
+
+## Origin & Sanitization
+
+The atomic shadow-build lifecycle, explicit connection cleanup for Windows, and deterministic two-phase FTS5 + regex query engine were extracted and rewritten from a private high-volume local archive indexing pipeline. All private message tables, personal lifelog schemas, and user data were removed and replaced with a synthetic incident, post-mortem, and runbook schema.
+
+## What It Intentionally Does Not Do
+
+This engine is intentionally optimized for immutable or periodic batch snapshots (CI builds, daily log archives, local CLI runbook indexes).
+
+It does **not**:
+
+- handle continuous multi-writer single-row streaming mutations in place
+- shard indexes across multiple hosts or replace Elasticsearch/OpenSearch for multi-terabyte telemetry lakes
+
+---
+
+## Shadow Build & Swap Lifecycle
 
 ```text
   JSONL / Iterator
-         │
-         ▼  (1) Disposable Shadow Build on <target>.<pid>.<uuid>.tmp
+         |
+         v  (1) Disposable Shadow Build on <target>.<pid>.<uuid>.tmp
   PRAGMA journal_mode=OFF; synchronous=OFF; temp_store=MEMORY; cache_size=-128000;
-         │
-         ▼  (2) Chunked executemany() + keyset FTS5 sync + deferred B-tree indexes
-         │
-         ▼  (3) ANALYZE + PRAGMA optimize;
-         │
-         ▼  (4) Durable mode transition (DELETE or WAL + wal_checkpoint(TRUNCATE))
-         │
-         ▼  (5) PRAGMA integrity_check; + FTS5 'integrity-check'
-         │
-         ▼  (6) Explicit cursor & Connection.close() + sidecar cleanup
-         │
-         ▼  (7) os.replace(<target>.<pid>.<uuid>.tmp, <target>.db)
-  Live Production Archive (atomic swap)
+         |
+         v  (2) Chunked executemany() + keyset FTS5 sync + deferred B-tree indexes
+         |
+         v  (3) ANALYZE + PRAGMA optimize;
+         |
+         v  (4) Durable mode transition (DELETE or WAL + wal_checkpoint(TRUNCATE))
+         |
+         v  (5) PRAGMA integrity_check; + FTS5 'integrity-check'
+         |
+         v  (6) Explicit cursor & Connection.close() + sidecar cleanup
+         |
+         v  (7) os.replace(<target>.<pid>.<uuid>.tmp, <target>.db)
+  Live Archive (atomic swap)
 ```
 
-* **Crash Safety & Builder Isolation:** Each build writes to a unique PID + UUID shadow path (`<target>.<pid>.<uuid>.tmp`) with secondary B-tree index creation deferred until after bulk ingestion and FTS5 sync (eliminating intermediate B-tree page splits). Any exception during steps `(1)–(7)` closes all handles, removes temporary shadow files, and leaves `<target>.db` byte-for-byte untouched.
-* **Windows File-Lock Hygiene:** Unlike POSIX `rename(2)`, where unlinked files stay attached to open file descriptors, Windows enforces mandatory sharing locks on active SQLite handles. This engine explicitly closes every `sqlite3.Connection` and cursor before unlinking sidecars or invoking `os.replace()`. Note that Python's `with sqlite3.connect(...)` context manager only commits/rolls back transactions and does **not** close the connection; all connections here are closed explicitly via `close()` / `try...finally`.
+- **Crash Safety & Builder Isolation:** Each build writes to a unique PID + UUID shadow path (`<target>.<pid>.<uuid>.tmp`) with secondary B-tree index creation deferred until after bulk ingestion and FTS5 sync (avoiding B-tree page splits during bulk load). Any exception during steps `(1)-(7)` closes open handles, removes shadow artifacts, and leaves any existing `<target>.db` byte-for-byte untouched.
+- **Windows File-Lock Hygiene:** Python's `with sqlite3.connect(...)` context manager only commits/rolls back transactions and does not close the connection. Every build path explicitly calls `close()` in `try...finally` before unlinking sidecars or invoking `os.replace()`.
 
 ---
 
-## Production Reader Isolation
+## Reader Isolation & Self-Contained Snapshots
 
-Production query processes use `AtomicSearchEngine`, which isolates readers from build workloads through:
+`AtomicSearchEngine` opens databases via URI (`file:///...?mode=ro`) and immediately applies `PRAGMA query_only = ON;`. Any accidental `INSERT`, `UPDATE`, `DELETE`, `CREATE`, or `DROP` raises `sqlite3.OperationalError` at both VFS and VM layers.
 
-1. **Zero Write Contention During Builds:** Rebuilds target `<target>.db.tmp` exclusively, so live readers never block on writer locks or observe intermediate schema/FTS5 states.
-2. **Dual Read-Only Enforcement:** Connections open via URI (`file:///...?mode=ro`) **and** immediately apply `PRAGMA query_only = ON;`. Any accidental `INSERT`, `UPDATE`, `DELETE`, `CREATE`, or `DROP` raises `sqlite3.OperationalError` at both VFS and SQLite VM layers.
-3. **Self-Contained Snapshots by Default (`DELETE` Mode):** Finalizing the shadow artifact in `PRAGMA journal_mode = DELETE` ensures zero `-wal` or `-shm` sidecars are required or generated when read-only workers open the archive—safe even on read-only mounted filesystems or immutable container layers. (`WAL` mode with `wal_checkpoint(TRUNCATE)` is also supported when post-swap concurrency requires it.)
+`BuildConfig.final_journal_mode` defaults to `"DELETE"` so the swapped artifact needs zero `-wal` or `-shm` sidecars and opens cleanly via `?mode=ro` even on read-only mounted filesystems or immutable container layers (`"WAL"` with `wal_checkpoint(TRUNCATE)` is also supported when post-swap concurrency requires it).
 
 ---
 
 ## Trade-offs vs. Distributed Full-Text Engines
 
-| Dimension | `atomic-sqlite-fts5-engine` | Distributed Engines (Elasticsearch / OpenSearch / Typesense) |
+| Dimension | `atomic-sqlite-fts5-engine` | Distributed Engines (Elasticsearch / OpenSearch) |
 | :--- | :--- | :--- |
-| **Operational Footprint** | Zero external runtime deps, zero daemon/JVM, single `.db` artifact | Multi-node cluster, JVM/native memory tuning, shard/replica ops |
-| **Cold / Local Read Latency** | Sub-millisecond to low-millisecond in-process C library reads | Network hop + coordinator scatter-gather overhead |
-| **Hybrid Structured + Text** | Single query plan joins `documents_fts` BM25 with composite B-tree indexes `(service_key, timestamp_ms)` & `(severity, timestamp_ms)` | Requires denormalized document duplication or costly cross-index joins |
-| **Artifact Distribution** | Immutable snapshot push (`S3` / `rsync` / `os.replace`) with deterministic results | Mutable cluster state requiring index aliases and snapshot/restore pipelines |
-| **Write Pattern Fit** | **Batch / periodic shadow rebuilds** (archive logs, post-mortems, runbooks) | **High-QPS continuous real-time mutations** across multiple concurrent writers |
-| **Scale Ceiling** | Single-node storage/RAM envelope (tens of thousands to millions of docs) | Multi-terabyte horizontal sharding across clusters |
-
-**Rule of thumb:** Choose `atomic-sqlite-fts5-engine` when your incident/runbook corpus fits on a single node, updates via batch/CI rebuilds, and benefits from deterministic local speed and zero infrastructure overhead. Choose a distributed cluster when ingestion requires continuous multi-writer sub-second visibility or multi-terabyte horizontal sharding.
+| **Operational Footprint** | Zero external deps, zero daemon/JVM, single `.db` artifact | Multi-node cluster, JVM memory tuning, shard/replica ops |
+| **Local Read Latency** | Single-digit millisecond in-process C library reads | Network hop + coordinator scatter-gather overhead |
+| **Hybrid Structured + Text** | Single SQLite query joining `documents_fts` BM25 with composite B-tree indexes | Requires denormalized duplication or costly cross-index joins |
+| **Write Pattern Fit** | **Batch / periodic shadow rebuilds** (archives, post-mortems, runbooks) | **Continuous high-QPS real-time writes** across concurrent writers |
+| **Scale Ceiling** | Single-node storage/RAM envelope | Multi-terabyte horizontal sharding across clusters |
 
 ---
 
 ## Schema & Query Architecture
 
-* **`documents`**: Canonical table storing `doc_uid` (`UNIQUE`), `doc_type` (`incident`, `postmortem`, `runbook`), `service_key`, `severity`, `timestamp_ms`, `occurred_at`, `author`, `title`, `body`, `tags`, and `metadata_json`.
-* **Composite Indexes**:
-  * `idx_documents_service_ts` on `(service_key, timestamp_ms)`
-  * `idx_documents_severity_ts` on `(severity, timestamp_ms)`
-  * `idx_documents_ts` on `(timestamp_ms)`
-  * `idx_documents_type_ts` on `(doc_type, timestamp_ms)`
-* **`documents_fts`**: FTS5 virtual table (`tokenize='unicode61 remove_diacritics 2'`) synchronized 1:1 via `rowid == documents.id`, enabling case- and accent-insensitive matching across Unicode text (e.g., `"exaustao critica"` matches `"Exaustão crítica"`).
-* **Two-Phase BM25 & Deferred `snippet()`**: Top-K scoring executes without invoking `snippet()` across every matching row; `snippet()` is evaluated only for the returned `LIMIT` rowids (`<= 20` by default).
-* **FTS5 Pre-Filter + Optional Regex Refinement**:
-  * Explicit FTS queries paired with `--regex` narrow candidates via FTS5 first, then stream candidate batches through compiled Python `re.Pattern` filters.
-  * Regex-only queries automatically extract sound mandatory word-boundary prefix tokens (avoiding false negatives on alternations `|` or optional quantifiers `?`/`*`/`{0}`) to accelerate regex scans via FTS5 when mathematically safe.
+- **`documents`**: Canonical table storing `doc_uid` (`UNIQUE`), `doc_type` (`incident`, `postmortem`, `runbook`), `service_key`, `severity`, `timestamp_ms`, `occurred_at`, `author`, `title`, `body`, `tags`, and `metadata_json`.
+- **Composite Indexes**: `idx_documents_service_ts (service_key, timestamp_ms)`, `idx_documents_severity_ts (severity, timestamp_ms)`, `idx_documents_ts (timestamp_ms)`, `idx_documents_type_ts (doc_type, timestamp_ms)`.
+- **`documents_fts`**: FTS5 virtual table (`tokenize='unicode61 remove_diacritics 2'`) synced 1:1 via `rowid == documents.id`, supporting accent-insensitive Unicode lookup (`"exaustao critica"` matches `"Exaustao critica"` with diacritics).
+- **Two-Phase BM25 & Deferred `snippet()`**: Top-K ranking executes first; `snippet()` evaluates only on the returned `LIMIT` rowids.
+- **FTS5 Pre-Filter + Regex Refinement**: Combines FTS5 candidate narrowing with compiled `re.Pattern` filtering and safely falls back to metadata scan when alternations `|` or optional quantifiers make token extraction unsound.
 
 ---
 
-## Installation
+## Installation & CLI Usage
 
-Requires Python 3.9+ (pure stdlib runtime; `pytest` only for running tests).
+Requires Python 3.9+ (`pytest` for tests).
 
 ```powershell
 python -m pip install -e ".[dev]"
-```
 
----
-
-## CLI Usage
-
-```powershell
 # 1. Atomically build (or rebuild) an archive from JSONL / JSONL.GZ files
 atomic-fts build --input incidents.jsonl runbooks.jsonl.gz --db ops_archive.db
 
@@ -107,43 +107,13 @@ atomic-fts show INC-2026-000142 --db ops_archive.db
 atomic-fts stats --db ops_archive.db
 ```
 
----
-
-## Benchmark
-
-Run the synthetic incident/post-mortem/runbook benchmark (defaults to 25,000 documents and 50 mixed BM25, filtered, diacritic-folded, and regex-refined queries):
+## Benchmark & Tests
 
 ```powershell
-python scripts/benchmark_build.py --docs 25000 --queries 50
-```
-
-Observed run on Python 3.9.13 (Windows, SQLite 3.37.2, `chunk_size=20,000`, `DELETE` mode):
-
-```text
-Documents indexed : 25,000 (FTS5 rows: 25,000)
-Journal / Check   : DELETE / integrity=ok
-Build time        : 2.5493 s
-Build throughput  : 9,806.44 docs/sec
-Database size     : 31.297 MB (32,817,152 bytes)
-Queries executed  : 50 (total hits: 1,000)
-Query latency (ms): min=0.935 | P50=35.785 | P95=68.399 | max=105.926 | mean=35.403
-```
-
----
-
-## Running Tests
-
-```powershell
+python scripts/benchmark_build.py --docs 5000 --queries 50
 pytest -v
 ```
 
-Test coverage includes:
-* `tests/test_atomic_builder.py`: chunk boundary ingestion, `rowid == documents.id` parity, simulated crashes mid-ingestion and post-FTS preserving the live `.db` SHA-256 unchanged, `WAL` & `DELETE` swaps, sidecar cleanup, and Unicode diacritic-insensitive search.
-* `tests/test_query_engine.py`: `PRAGMA query_only = ON` mutation rejection (`INSERT`/`UPDATE`/`DELETE`/`CREATE`/`DROP`), BM25 ranking & `snippet()`, `EXPLAIN QUERY PLAN` verification on composite indexes, and FTS5 pre-filter + regex refinement (including alternation soundness).
-* `tests/test_cli_and_benchmark.py`: end-to-end CLI (`build`, `search`, `show`, `stats`), Python 3.9 ISO-8601 `"Z"` timestamp parsing, and synthetic benchmark execution.
-
----
-
 ## License
 
-[MIT](LICENSE)
+MIT - see [LICENSE](LICENSE).
