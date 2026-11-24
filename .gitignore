@@ -1,0 +1,28 @@
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Packaging / build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Environments
+.venv/
+venv/
+env/
+
+# SQLite artifacts & shadow swap files
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.db.tmp
+*.db.tmp-*
+*.sqlite
+*.sqlite3
