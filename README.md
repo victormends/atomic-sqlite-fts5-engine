@@ -69,7 +69,7 @@ It does **not**:
 | Dimension | `atomic-sqlite-fts5-engine` | Distributed Engines (Elasticsearch / OpenSearch) |
 | :--- | :--- | :--- |
 | **Operational Footprint** | Zero external deps, zero daemon/JVM, single `.db` artifact | Multi-node cluster, JVM memory tuning, shard/replica ops |
-| **Local Read Latency** | Low-tens-of-milliseconds in-process C library reads (measured 1.7 ms min / 17.3 ms P50 on 5k docs with BM25 + snippet extraction; zero network hop) | Network hop + coordinator scatter-gather overhead |
+| **Local Read Latency** | Low-tens-of-milliseconds in-process C library reads (measured `2.301 ms` min / `23.280 ms` mixed P50 on 5k synthetic docs; pure FTS5 BM25 P50 `23.265 ms` across ~625 dense matches/query + `snippet()` vs regex/fallback P50 `30.108 ms`; zero network hop) | Network hop + coordinator scatter-gather overhead |
 | **Hybrid Structured + Text** | Single SQLite query joining `documents_fts` BM25 with composite B-tree indexes | Requires denormalized duplication or costly cross-index joins |
 | **Write Pattern Fit** | **Batch / periodic shadow rebuilds** (archives, post-mortems, runbooks) | **Continuous high-QPS real-time writes** across concurrent writers |
 | **Scale Ceiling** | Single-node storage/RAM envelope | Multi-terabyte horizontal sharding across clusters |
@@ -122,10 +122,14 @@ Output from `python scripts/benchmark_build.py --docs 5000 --queries 50` (with p
 | :--- | :--- |
 | Documents & FTS5 Rows Indexed | `5,000` (`5,000` FTS5 rows) |
 | Final Journal / Integrity Check | `DELETE` / `integrity=ok` |
-| Shadow Build + Fsync + Swap Time | `0.7049 s` (`7,092.72 docs/sec`) |
+| Shadow Build + Fsync + Swap Time | `1.1712 s` (`4,269.14 docs/sec`) |
 | Final Archive Size | `5.863 MB` (`6,148,096 bytes`) |
-| Queries Executed | `50` (`1,000` total hits) |
-| Query Latency (`min` / `P50` / `P95` / `max` / `mean`) | `1.726 ms` / `17.337 ms` / `27.365 ms` / `31.072 ms` / `16.690 ms` |
+| Queries Executed | `50` (`1,000` total hits across `35` pure FTS5 BM25, `10` regex/fallback, `5` metadata-only queries) |
+| Mixed Query Latency (`min` / `P50` / `P95` / `max` / `mean`) | `2.301 ms` / `23.280 ms` / `40.836 ms` / `56.236 ms` / `23.720 ms` |
+| Pure FTS5 BM25 Breakdown (`count=35`: `P50` / `P95` / `mean`) | `23.265 ms` / `42.608 ms` / `24.658 ms` |
+| Regex / Scan Fallback Breakdown (`count=10`: `P50` / `P95` / `mean`) | `30.108 ms` / `40.836 ms` / `30.613 ms` |
+
+Because the 5,000 synthetic records cycle through 8 dense scenario templates (~625 matching rows per FTS5 query before `ORDER BY bm25_score` + `LIMIT 20` + `snippet()`), pure FTS5 BM25 median latency is `23.265 ms` (dropping to `2.301 ms` min on narrower filtered queries), while regex post-filtering and alternation scan fallbacks raise the regex breakdown to `30.108 ms` P50.
 
 ## License
 

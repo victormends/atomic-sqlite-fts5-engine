@@ -155,6 +155,27 @@ def percentile(sorted_values: Sequence[float], pct: float) -> float:
     return float(sorted_values[lo] * (1.0 - frac) + sorted_values[hi] * frac)
 
 
+def _summarize_latencies(values: Sequence[float]) -> Dict[str, Any]:
+    if not values:
+        return {
+            "count": 0,
+            "min_ms": 0.0,
+            "p50_ms": 0.0,
+            "p95_ms": 0.0,
+            "max_ms": 0.0,
+            "mean_ms": 0.0,
+        }
+    s = sorted(values)
+    return {
+        "count": len(s),
+        "min_ms": round(s[0], 3),
+        "p50_ms": round(percentile(s, 50.0), 3),
+        "p95_ms": round(percentile(s, 95.0), 3),
+        "max_ms": round(s[-1], 3),
+        "mean_ms": round(sum(s) / len(s), 3),
+    }
+
+
 def build_query_workload(base_ts_ms: int, total_docs: int) -> List[Dict[str, Any]]:
     mid_ts = base_ts_ms + (total_docs // 2) * 60_000
     end_ts = base_ts_ms + max(total_docs - 1, 0) * 60_000
@@ -204,21 +225,29 @@ def run_benchmark(
 
         workload = build_query_workload(1_767_225_600_000, docs)
         latencies_ms: List[float] = []
+        fts5_bm25_latencies_ms: List[float] = []
+        regex_latencies_ms: List[float] = []
         total_hits = 0
 
         engine = AtomicSearchEngine(target_db)
         try:
-            # Warm page cache with one untimed probe? No: include true cold-to-warm mix or measure all N queries directly.
+            # Include true cold-to-warm mix across all N queries directly.
             for idx in range(queries):
                 spec = workload[idx % len(workload)]
                 resp = engine.search(**spec)
                 latencies_ms.append(resp.elapsed_ms)
+                if bool(spec.get("regex_pattern")):
+                    regex_latencies_ms.append(resp.elapsed_ms)
+                elif bool(spec.get("query")):
+                    fts5_bm25_latencies_ms.append(resp.elapsed_ms)
                 total_hits += resp.total_returned
         finally:
             # Explicitly close SQLite connection before TemporaryDirectory cleanup on Windows.
             engine.close()
 
         sorted_lat = sorted(latencies_ms)
+        fts5_summary = _summarize_latencies(fts5_bm25_latencies_ms)
+        regex_summary = _summarize_latencies(regex_latencies_ms)
         return {
             "docs": build_stats.documents_indexed,
             "fts_rows": build_stats.fts_rows_indexed,
@@ -236,6 +265,8 @@ def run_benchmark(
             "latency_p95_ms": round(percentile(sorted_lat, 95.0), 3),
             "latency_max_ms": round(sorted_lat[-1], 3),
             "latency_mean_ms": round(sum(sorted_lat) / len(sorted_lat), 3),
+            "fts5_bm25_breakdown": fts5_summary,
+            "regex_breakdown": regex_summary,
         }
     finally:
         if tmp_ctx is not None:
@@ -280,6 +311,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"P95={report['latency_p95_ms']:.3f} | "
             f"max={report['latency_max_ms']:.3f} | "
             f"mean={report['latency_mean_ms']:.3f}"
+        )
+        fts = report["fts5_bm25_breakdown"]
+        rx = report["regex_breakdown"]
+        print(
+            f"Pure FTS5 BM25    : count={fts['count']} | "
+            f"P50={fts['p50_ms']:.3f} ms | P95={fts['p95_ms']:.3f} ms | mean={fts['mean_ms']:.3f} ms"
+        )
+        print(
+            f"Regex / Fallback  : count={rx['count']} | "
+            f"P50={rx['p50_ms']:.3f} ms | P95={rx['p95_ms']:.3f} ms | mean={rx['mean_ms']:.3f} ms"
         )
         print("============================================================")
     return 0
