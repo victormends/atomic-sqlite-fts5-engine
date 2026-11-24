@@ -99,6 +99,26 @@ def _close_quietly(conn: Optional[sqlite3.Connection]) -> None:
             pass
 
 
+def _fsync_file(path: Path) -> None:
+    """Flush OS dirty pages for `path` to disk prior to atomic replacement."""
+    # Open in "rb+" mode because os.fsync() fails on read-only ("rb") handles on Windows.
+    with open(path, "rb+") as fh:
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def _fsync_parent_dir(path: Path) -> None:
+    """Sync the target parent directory entry on POSIX after os.replace()."""
+    if os.name != "posix":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    dir_fd = os.open(str(path.parent), flags)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 def _populate_fts_in_chunks(conn: sqlite3.Connection, chunk_size: int) -> int:
     """Populate `documents_fts` in keyset-paginated chunks preserving `rowid == documents.id`."""
     read_cur = conn.cursor()
@@ -274,8 +294,10 @@ def build_atomic_index(
         conn = None
 
         _remove_sidecars(tmp_path)
+        _fsync_file(tmp_path)
         _remove_sidecars(target)
         os.replace(str(tmp_path), str(target))
+        _fsync_parent_dir(target)
     except Exception:
         _close_quietly(conn)
         conn = None

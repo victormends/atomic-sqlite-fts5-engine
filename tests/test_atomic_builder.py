@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, List, Tuple
 
 import pytest
 
+import atomic_fts.builder as builder_mod
 from atomic_fts.builder import BuildConfig, IntegrityCheckError, build_atomic_index
 from atomic_fts.query import AtomicSearchEngine
 from atomic_fts.schema import IncidentDocument
@@ -229,4 +231,38 @@ def test_shadow_temp_files_use_unique_pid_uuid_and_cleanup_completely(tmp_path: 
     assert observed_files[0].endswith(".tmp")
     assert observed_files[0] != "isolated.db.tmp"
     assert list(tmp_path.glob("*.tmp*")) == []
+
+
+def test_pre_swap_fsync_runs_on_shadow_db_before_os_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "durable.db"
+    events: List[Tuple[str, str]] = []
+    real_fsync_file = builder_mod._fsync_file
+    real_fsync_parent = builder_mod._fsync_parent_dir
+    real_replace = os.replace
+
+    def tracked_fsync_file(path: Path) -> None:
+        events.append(("fsync_file", str(path)))
+        real_fsync_file(path)
+
+    def tracked_replace(src: str, dst: str) -> None:
+        events.append(("replace", f"{src}->{dst}"))
+        real_replace(src, dst)
+
+    def tracked_fsync_parent(path: Path) -> None:
+        events.append(("fsync_parent", str(path)))
+        real_fsync_parent(path)
+
+    monkeypatch.setattr(builder_mod, "_fsync_file", tracked_fsync_file)
+    monkeypatch.setattr(os, "replace", tracked_replace)
+    monkeypatch.setattr(builder_mod, "_fsync_parent_dir", tracked_fsync_parent)
+
+    build_atomic_index([_sample_doc(1, title="Durability Check")], db_path)
+
+    assert [name for name, _ in events] == ["fsync_file", "replace", "fsync_parent"]
+    assert events[0][1].endswith(".tmp")
+    assert events[1][1].endswith(f"->{db_path}")
+    assert events[2][1] == str(db_path)
+
 

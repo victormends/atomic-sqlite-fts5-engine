@@ -1,6 +1,6 @@
 # atomic-sqlite-fts5-engine
 
-A zero-dependency Python 3.9+ stdlib (`sqlite3`) shadow-build indexer and deterministic read-only search engine for operational incident logs, post-mortems, and runbook archives.
+A zero-dependency Python 3.11+ stdlib (`sqlite3`) shadow-build indexer (CI-verified on Ubuntu 3.11 and 3.12; compatible with 3.9+) and deterministic read-only search engine for operational incident logs, post-mortems, and runbook archives.
 
 ---
 
@@ -45,13 +45,13 @@ It does **not**:
          |
          v  (5) PRAGMA integrity_check; + FTS5 'integrity-check'
          |
-         v  (6) Explicit cursor & Connection.close() + sidecar cleanup
+         v  (6) Explicit cursor & Connection.close() + sidecar cleanup + _fsync_file(.tmp)
          |
-         v  (7) os.replace(<target>.<pid>.<uuid>.tmp, <target>.db)
+         v  (7) os.replace(<target>.<pid>.<uuid>.tmp, <target>.db) + _fsync_parent_dir()
   Live Archive (atomic swap)
 ```
 
-- **Crash Safety & Builder Isolation:** Each build writes to a unique PID + UUID shadow path (`<target>.<pid>.<uuid>.tmp`) with secondary B-tree index creation deferred until after bulk ingestion and FTS5 sync (avoiding B-tree page splits during bulk load). Any exception during steps `(1)-(7)` closes open handles, removes shadow artifacts, and leaves any existing `<target>.db` byte-for-byte untouched.
+- **Process-Crash Isolation vs. Power-Loss Durability:** Each build writes to a unique PID + UUID shadow path (`<target>.<pid>.<uuid>.tmp`) with secondary B-tree index creation deferred until after bulk ingestion and FTS5 sync (avoiding B-tree page splits during bulk load). Any Python exception or process kill during steps `(1)-(6)` cleans up shadow artifacts and leaves any existing `<target>.db` byte-for-byte untouched (process-crash isolation). For power-loss durability on the final commit boundary, `_fsync_file()` opens the closed `.tmp` database in `"rb+"` mode and calls `os.fsync()` before `os.replace()`, followed by `_fsync_parent_dir()` on POSIX to persist the updated directory entry.
 - **Windows File-Lock Hygiene:** Python's `with sqlite3.connect(...)` context manager only commits/rolls back transactions and does not close the connection. Every build path explicitly calls `close()` in `try...finally` before unlinking sidecars or invoking `os.replace()`.
 
 ---
@@ -88,9 +88,9 @@ It does **not**:
 
 ## Installation & CLI Usage
 
-Requires Python 3.9+ (`pytest` for tests).
+Requires **Python 3.11+** (CI-verified on Ubuntu 3.11 and 3.12; compatible with 3.9+, `pytest` for tests).
 
-```powershell
+```bash
 python -m pip install -e ".[dev]"
 
 # 1. Atomically build (or rebuild) an archive from JSONL / JSONL.GZ files
@@ -109,10 +109,23 @@ atomic-fts stats --db ops_archive.db
 
 ## Benchmark & Tests
 
-```powershell
+```bash
 python scripts/benchmark_build.py --docs 5000 --queries 50
 pytest -v
 ```
+
+## Measured Benchmark Results
+
+Output from `python scripts/benchmark_build.py --docs 5000 --queries 50` (with pre-swap `_fsync_file` enabled):
+
+| Metric | Measured Value |
+| :--- | :--- |
+| Documents & FTS5 Rows Indexed | `5,000` (`5,000` FTS5 rows) |
+| Final Journal / Integrity Check | `DELETE` / `integrity=ok` |
+| Shadow Build + Fsync + Swap Time | `0.7049 s` (`7,092.72 docs/sec`) |
+| Final Archive Size | `5.863 MB` (`6,148,096 bytes`) |
+| Queries Executed | `50` (`1,000` total hits) |
+| Query Latency (`min` / `P50` / `P95` / `max` / `mean`) | `1.726 ms` / `17.337 ms` / `27.365 ms` / `31.072 ms` / `16.690 ms` |
 
 ## License
 
