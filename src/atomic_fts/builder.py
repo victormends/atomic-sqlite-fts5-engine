@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +19,7 @@ from atomic_fts.schema import (
     SCHEMA_VERSION,
     DocumentInput,
     coerce_document_row,
+    create_indexes,
     create_schema,
 )
 
@@ -181,7 +183,7 @@ def build_atomic_index(
 
     target = Path(target_path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = Path(f"{target}.tmp")
+    tmp_path = Path(f"{target}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
 
     # Remove stale temporary artifacts from any prior aborted attempt before opening.
     _cleanup_shadow_artifacts(tmp_path)
@@ -201,7 +203,8 @@ def build_atomic_index(
         conn.execute("PRAGMA temp_store = MEMORY;")
         conn.execute(f"PRAGMA cache_size = -{int(cfg.cache_size_kib)};")
 
-        create_schema(conn)
+        # Defer secondary B-tree index creation until after bulk ingestion to avoid page splits.
+        create_schema(conn, include_indexes=False)
         if on_stage is not None:
             on_stage("schema_created", 0)
 
@@ -230,6 +233,10 @@ def build_atomic_index(
         fts_count = _populate_fts_in_chunks(conn, cfg.chunk_size)
         if on_stage is not None:
             on_stage("fts_populated", fts_count)
+
+        create_indexes(conn)
+        if on_stage is not None:
+            on_stage("indexes_created", doc_count)
 
         built_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         meta_rows = [

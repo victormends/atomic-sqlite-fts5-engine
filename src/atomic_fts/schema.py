@@ -185,14 +185,25 @@ def coerce_document_row(
     )
 
 
-def create_schema(conn: sqlite3.Connection) -> None:
-    """Create core tables, composite indexes, and the FTS5 virtual table."""
+def create_indexes(conn: sqlite3.Connection) -> None:
+    """Create secondary composite B-tree indexes (deferred until after bulk shadow load)."""
+    cur = conn.cursor()
+    try:
+        for index_sql in INDEXES_SQL:
+            cur.execute(index_sql)
+    finally:
+        cur.close()
+
+
+def create_schema(conn: sqlite3.Connection, include_indexes: bool = True) -> None:
+    """Create core tables, FTS5 virtual table, and optionally secondary composite indexes."""
     cur = conn.cursor()
     try:
         cur.execute(ENGINE_META_TABLE_SQL)
         cur.execute(DOCUMENTS_TABLE_SQL)
-        for index_sql in INDEXES_SQL:
-            cur.execute(index_sql)
+        if include_indexes:
+            for index_sql in INDEXES_SQL:
+                cur.execute(index_sql)
         cur.execute(FTS5_TABLE_SQL)
     finally:
         cur.close()

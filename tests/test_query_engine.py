@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from atomic_fts.builder import build_atomic_index
+from atomic_fts.builder import BuildConfig, build_atomic_index
 from atomic_fts.query import AtomicSearchEngine, InvalidQueryError, build_safe_fts_expression
 from atomic_fts.schema import IncidentDocument
 
@@ -191,3 +191,40 @@ def test_get_stats_and_get_document(seeded_db: Path) -> None:
         assert doc is not None
         assert doc.metadata["mttr"] == 27
         assert engine.get_document("MISSING-999") is None
+
+
+def test_raw_fts_syntax_error_and_filtered_regex_offset_pagination(tmp_path: Path) -> None:
+    db_path = tmp_path / "paginated.db"
+    base_ts = 1_767_225_600_000
+    docs = [
+        IncidentDocument(
+            doc_uid=f"INC-PAG-{idx:02d}",
+            doc_type="incident",
+            service_key="orders-api" if idx <= 3 else "billing-api",
+            severity="SEV1" if idx <= 3 else "SEV2",
+            timestamp_ms=base_ts + idx * 1000,
+            title=f"Worker saturation alert {idx}",
+            body=f"Thread pool limit reached WARN-{100 + idx} on worker node",
+            tags="pool saturation",
+        )
+        for idx in range(1, 5)
+    ]
+    build_atomic_index(docs, db_path, config=BuildConfig(final_journal_mode="WAL"))
+
+    with AtomicSearchEngine(db_path) as engine:
+        with pytest.raises(InvalidQueryError):
+            engine.search('AND OR "unclosed', raw_fts=True)
+
+        page = engine.search(
+            "saturation",
+            service_key="orders-api",
+            severity="SEV1",
+            regex_pattern=r"WARN-10[123]",
+            limit=1,
+            offset=1,
+        )
+        assert page.total_returned == 1
+        assert page.hits[0].service_key == "orders-api"
+        assert page.hits[0].severity == "SEV1"
+        assert page.hits[0].doc_uid in {"INC-PAG-01", "INC-PAG-02", "INC-PAG-03"}
+

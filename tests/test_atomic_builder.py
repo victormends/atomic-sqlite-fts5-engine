@@ -208,3 +208,25 @@ def test_empty_corpus_and_invalid_config(tmp_path: Path) -> None:
         build_atomic_index([], db_path, config=BuildConfig(final_journal_mode="MEMORY"))
     with pytest.raises(IntegrityCheckError):
         raise IntegrityCheckError("synthetic check")
+
+
+def test_shadow_temp_files_use_unique_pid_uuid_and_cleanup_completely(tmp_path: Path) -> None:
+    db_path = tmp_path / "isolated.db"
+    observed_files = []
+
+    def inspect_mid_build(stage: str, _count: int) -> None:
+        if stage == "indexes_created":
+            observed_files.extend(p.name for p in tmp_path.glob("*.tmp"))
+
+    stats = build_atomic_index(
+        [_sample_doc(1, title="Isolated Build One"), _sample_doc(2, title="Isolated Build Two")],
+        db_path,
+        on_stage=inspect_mid_build,
+    )
+    assert stats.integrity_status == "ok"
+    assert len(observed_files) == 1
+    assert observed_files[0].startswith("isolated.db.")
+    assert observed_files[0].endswith(".tmp")
+    assert observed_files[0] != "isolated.db.tmp"
+    assert list(tmp_path.glob("*.tmp*")) == []
+

@@ -17,10 +17,10 @@ Rebuilding a full-text search index directly inside a live SQLite database intro
 ```text
   JSONL / Iterator
          │
-         ▼  (1) Disposable Shadow Build on <target>.db.tmp
+         ▼  (1) Disposable Shadow Build on <target>.<pid>.<uuid>.tmp
   PRAGMA journal_mode=OFF; synchronous=OFF; temp_store=MEMORY; cache_size=-128000;
          │
-         ▼  (2) Chunked executemany() + keyset FTS5 sync (rowid == documents.id)
+         ▼  (2) Chunked executemany() + keyset FTS5 sync + deferred B-tree indexes
          │
          ▼  (3) ANALYZE + PRAGMA optimize;
          │
@@ -30,11 +30,11 @@ Rebuilding a full-text search index directly inside a live SQLite database intro
          │
          ▼  (6) Explicit cursor & Connection.close() + sidecar cleanup
          │
-         ▼  (7) os.replace(<target>.db.tmp, <target>.db)
+         ▼  (7) os.replace(<target>.<pid>.<uuid>.tmp, <target>.db)
   Live Production Archive (atomic swap)
 ```
 
-* **Crash Safety:** Any exception raised during steps `(1)–(7)` explicitly closes open handles, removes `<target>.db.tmp` (and any `-wal`/`-shm`/`-journal` sidecars), and leaves the existing live `<target>.db` byte-for-byte untouched.
+* **Crash Safety & Builder Isolation:** Each build writes to a unique PID + UUID shadow path (`<target>.<pid>.<uuid>.tmp`) with secondary B-tree index creation deferred until after bulk ingestion and FTS5 sync (eliminating intermediate B-tree page splits). Any exception during steps `(1)–(7)` closes all handles, removes temporary shadow files, and leaves `<target>.db` byte-for-byte untouched.
 * **Windows File-Lock Hygiene:** Unlike POSIX `rename(2)`, where unlinked files stay attached to open file descriptors, Windows enforces mandatory sharing locks on active SQLite handles. This engine explicitly closes every `sqlite3.Connection` and cursor before unlinking sidecars or invoking `os.replace()`. Note that Python's `with sqlite3.connect(...)` context manager only commits/rolls back transactions and does **not** close the connection; all connections here are closed explicitly via `close()` / `try...finally`.
 
 ---
